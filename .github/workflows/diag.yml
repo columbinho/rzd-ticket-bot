@@ -1,0 +1,28 @@
+name: Диагностика сети до РЖД
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Сеть
+        run: |
+          set +e
+          echo "== egress IP"; curl -s -m 10 https://ipinfo.io/json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('ip'),d.get('country'),d.get('org'))"
+          echo "== DNS"; getent ahosts ticket.rzd.ru | head -4; getent ahosts pass.rzd.ru | head -2
+          for h in ticket.rzd.ru pass.rzd.ru www.rzd.ru; do
+            echo "== TCP 443 $h"; timeout 20 bash -c "</dev/tcp/$h/443" && echo "tcp ok" || echo "tcp FAIL ($?)"
+          done
+          echo "== curl ticket.rzd.ru (verbose, 30s)"
+          curl -sv -m 30 --connect-timeout 15 --cacert certs/russian_trusted_ca.pem -A 'Mozilla/5.0' https://ticket.rzd.ru/ -o /dev/null 2>&1 | grep -E '^\* |^< HTTP|^< server' | head -20
+          echo "== API TrainPricing (40s)"
+          curl -s -m 40 --connect-timeout 15 --cacert certs/russian_trusted_ca.pem -A 'Mozilla/5.0' -H 'Content-Type: application/json' -H 'Origin: https://ticket.rzd.ru' -H 'Referer: https://ticket.rzd.ru/' -X POST 'https://ticket.rzd.ru/apib2b/p/Railway/V1/Search/TrainPricing?service_provider=B2B_RZD' -d '{"Origin":"2100001","Destination":"2000006","DepartureDate":"2026-10-11T00:00:00","TimeFrom":0,"TimeTo":24,"CarGrouping":"DontGroup","GetByLocalTime":true,"SpecialPlacesDemand":"StandardPlacesAndForDisabledPersons","CarIssuingType":"All","GetTrainsFromSchedule":true}' -o api.json -w 'HTTP %{http_code} %{size_download}B %{time_total}s\n'; echo "exit=$?"; head -c 300 api.json; echo
+          echo "== контроль: другие российские сайты"
+          for u in https://www.tutu.ru/ https://yandex.ru/ https://www.cbr.ru/ https://www.gosuslugi.ru/; do printf '%s ' "$u"; curl -s -o /dev/null -m 20 --connect-timeout 10 -w '%{http_code} %{time_total}s\n' "$u" || echo "FAIL $?"; done
