@@ -15,7 +15,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +44,19 @@ jobs:
           DEPARTURE_TIME: ${{ vars.DEPARTURE_TIME }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
-        run: python3 check_rzd.py
+          NOTIFY_AFTER_FAILURES: "30"   # ошибки считаются по каждой проверке; 30 подряд ≈ 25 минут недоступности
+        # GitHub не запускает расписание чаще раза в 5 минут, поэтому внутри одного запуска
+        # проверяем несколько раз: каждые 45 секунд, пока не пройдёт 4,5 минуты
+        run: |
+          deadline=$((SECONDS + 270))
+          n=0
+          while :; do
+            n=$((n + 1)); echo "--- проверка $n, $(date -u +%H:%M:%S) UTC"
+            python3 check_rzd.py || true
+            left=$((deadline - SECONDS))
+            [ "$left" -le 45 ] && break
+            sleep 45
+          done
 
       - name: Сохранить состояние
         if: always()
