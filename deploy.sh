@@ -15,7 +15,7 @@ $GH auth status >/dev/null 2>&1 || { echo "Сначала вход: $GH auth log
 $GH auth status 2>&1 | grep -q "'workflow'" || { echo "У gh нет права workflow. Выполни: $GH auth refresh -h github.com -s workflow"; exit 1; }
 
 if [ "$VIS" = private ]; then
-  sed -i '' 's#- cron: "\*/5 \* \* \* \*"    \# каждые 5 минут#- cron: "*/30 * * * *"   \# каждые 30 минут#' .github/workflows/check.yml
+  sed -i '' 's#^    - cron: .*#    - cron: "*/30 * * * *"   \# каждые 30 минут (UTC): приватный репозиторий, лимит 2000 минут Actions/мес#' .github/workflows/check.yml
 fi
 git add -A
 git -c user.name=levitacia -c user.email=claudeslava@icloud.com commit -qm "Расписание под $VIS-репозиторий" 2>/dev/null || true
