@@ -40,6 +40,8 @@ jobs:
           CAR_TYPES: ${{ vars.CAR_TYPES }}
           INCLUDE_SIDE_LOWER: ${{ vars.INCLUDE_SIDE_LOWER }}
           MIN_LOWER: ${{ vars.MIN_LOWER }}
+          SOURCE: ${{ vars.SOURCE }}
+          DEPARTURE_TIME: ${{ vars.DEPARTURE_TIME }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
         run: python3 check_rzd.py

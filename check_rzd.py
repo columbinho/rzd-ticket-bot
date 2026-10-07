@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Следит за свободными нижними местами на конкретный поезд РЖД и пишет в Telegram.
 
-Источник — API поиска ticket.rzd.ru (тот же, что у сайта), вход не нужен:
-  POST /apib2b/p/Railway/V1/Search/TrainPricing → поезда с группами вагонов,
-  в каждой группе LowerPlaceQuantity / UpperPlaceQuantity / LowerSidePlaceQuantity / UpperSidePlaceQuantity.
-Сертификат ticket.rzd.ru выдан Russian Trusted Root CA (НУЦ Минцифры), его нет в стандартных
-хранилищах — бандл лежит в certs/.
+Два источника данных (SOURCE в окружении или "source" в config.json):
+  tutu — POST https://offers-api.tutu.ru/railway/offers (тот же запрос, что у сайта tutu.ru), без входа;
+         в dictionary.train.voyages[*].cars лежат группы мест LOWER / UPPER / SIDE_LOWER / SIDE_UPPER
+         по типам вагонов RESERVED_SEAT / COMPARTMENT / LUX / SEDENTARY. Доступен с серверов GitHub.
+  rzd  — POST https://ticket.rzd.ru/apib2b/p/Railway/V1/Search/TrainPricing (API сайта РЖД);
+         РЖД не пускает адреса GitHub/облаков, годится только с домашнего компьютера. Сертификат
+         ticket.rzd.ru выдан Russian Trusted Root CA (НУЦ Минцифры) — бандл в certs/.
+Цифры обоих источников совпадают (сверено 2026-10-07 на двух датах).
 
 Настройки — config.json (локально) или переменные окружения (GitHub Actions). Состояние — state.json.
 """
@@ -22,7 +25,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "state.json")
 CONFIG_FILE = os.path.join(HERE, "config.json")
 CA_FILE = os.path.join(HERE, "certs", "russian_trusted_ca.pem")
-API = "https://ticket.rzd.ru/apib2b/p/Railway/V1/Search/TrainPricing?service_provider=B2B_RZD"
+API_RZD = "https://ticket.rzd.ru/apib2b/p/Railway/V1/Search/TrainPricing?service_provider=B2B_RZD"
+API_TUTU = "https://offers-api.tutu.ru/railway/offers"
+TUTU_CAR_TYPES = {"ReservedSeat": "RESERVED_SEAT", "Compartment": "COMPARTMENT", "Luxury": "LUX",
+                  "Sedentary": "SEDENTARY"}   # имена типов вагонов в конфиге — как у РЖД
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 CAR_TYPE_NAMES = {"ReservedSeat": "плацкарт", "Compartment": "купе", "Luxury": "СВ",
                   "Soft": "люкс", "Sedentary": "сидячий", "Shared": "общий"}
@@ -57,6 +63,13 @@ def load_config():
         cfg["include_side_lower"] = _bool(env["INCLUDE_SIDE_LOWER"])
     if env.get("MIN_LOWER"):
         cfg["min_lower"] = int(env["MIN_LOWER"])
+    if env.get("SOURCE"):
+        cfg["source"] = env["SOURCE"].strip().lower()
+    if env.get("DEPARTURE_TIME"):
+        cfg["departure_time"] = env["DEPARTURE_TIME"].strip()
+    cfg.setdefault("source", "tutu")
+    if cfg["source"] not in ("tutu", "rzd"):
+        raise SystemExit("source должен быть tutu или rzd")
     cfg.setdefault("car_types", ["ReservedSeat"])
     cfg.setdefault("include_side_lower", True)
     cfg.setdefault("min_lower", 1)
@@ -94,24 +107,87 @@ def ssl_context():
     return ctx
 
 
+def post_json(url, body, headers, ctx, who):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"User-Agent": UA, "Content-Type": "application/json",
+                                          "Accept": "application/json, text/plain, */*", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=45, context=ctx) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("%s HTTP %s: %r" % (who, e.code, e.read()[:300]))
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise RuntimeError("%s вернул не JSON (вероятно, антибот-заглушка): %r" % (who, raw[:200]))
+
+
 def search(cfg, date, ctx):
+    """Поезда на дату в едином виде: список {number, name, dep, arr, groups:[{car_type, lower, upper,
+    side_lower, side_upper, total, min_price}]}. car_type — в терминах РЖД (ReservedSeat, Compartment, Luxury)."""
+    return search_tutu(cfg, date, ctx) if cfg["source"] == "tutu" else search_rzd(cfg, date, ctx)
+
+
+def search_rzd(cfg, date, ctx):
     body = {"Origin": cfg["origin_code"], "Destination": cfg["destination_code"],
             "DepartureDate": "%sT00:00:00" % date, "TimeFrom": 0, "TimeTo": 24,
             "CarGrouping": "DontGroup", "GetByLocalTime": True,
             "SpecialPlacesDemand": "StandardPlacesAndForDisabledPersons",
             "CarIssuingType": "All", "GetTrainsFromSchedule": True}
-    req = urllib.request.Request(API, data=json.dumps(body).encode(), method="POST", headers={
-        "User-Agent": UA, "Content-Type": "application/json", "Accept": "application/json, text/plain, */*",
-        "Origin": "https://ticket.rzd.ru", "Referer": "https://ticket.rzd.ru/"})
-    try:
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-            raw = r.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError("РЖД HTTP %s: %r" % (e.code, e.read()[:300]))
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except ValueError:
-        raise RuntimeError("РЖД вернул не JSON (вероятно, антибот-заглушка): %r" % raw[:200])
+    data = post_json(API_RZD, body, {"Origin": "https://ticket.rzd.ru", "Referer": "https://ticket.rzd.ru/"}, ctx, "РЖД")
+    out = []
+    for t in data.get("Trains") or []:
+        groups = []
+        for g in t.get("CarGroups") or []:
+            if g.get("IsSaleForbidden"):
+                continue
+            groups.append({"car_type": g.get("CarType"), "lower": int(g.get("LowerPlaceQuantity") or 0),
+                           "upper": int(g.get("UpperPlaceQuantity") or 0),
+                           "side_lower": int(g.get("LowerSidePlaceQuantity") or 0),
+                           "side_upper": int(g.get("UpperSidePlaceQuantity") or 0),
+                           "total": int(g.get("TotalPlaceQuantity") or g.get("PlaceQuantity") or 0),
+                           "min_price": g.get("MinPrice")})
+        out.append({"number": t.get("DisplayTrainNumber") or t.get("TrainNumber"), "name": t.get("TrainName") or "",
+                    "dep": t.get("LocalDepartureDateTime"), "arr": t.get("LocalArrivalDateTime"), "groups": groups})
+    return out
+
+
+def search_tutu(cfg, date, ctx):
+    import uuid
+    body = {"routes": [{"departureStationCode": str(cfg["origin_code"]), "arrivalStationCode": str(cfg["destination_code"]),
+                        "departureDate": date}], "searchId": str(uuid.uuid4()), "source": "trainOffers"}
+    data = post_json(API_TUTU, body, {"Origin": "https://www.tutu.ru", "Referer": "https://www.tutu.ru/"}, ctx, "tutu")
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    voyages = ((data.get("dictionary") or {}).get("train") or {}).get("voyages") or {}
+    rzd_type = {v: k for k, v in TUTU_CAR_TYPES.items()}
+    out = []
+    for v in voyages.values():
+        groups = []
+        for car in v.get("cars") or []:
+            g = {"car_type": rzd_type.get(car.get("type"), car.get("type")), "lower": 0, "upper": 0,
+                 "side_lower": 0, "side_upper": 0, "total": 0, "min_price": None}
+            for sg in car.get("seatsGroups") or []:
+                n = int(sg.get("seatsCount") or 0)
+                key = {"LOWER": "lower", "UPPER": "upper", "SIDE_LOWER": "side_lower", "SIDE_UPPER": "side_upper"}.get(sg.get("type"))
+                if key:
+                    g[key] += n
+                g["total"] += n
+            groups.append(g)
+        # stops — остановки от станции посадки до конечной; иногда tutu отдаёт их без времени,
+        # тогда время берём из полного маршрута (stopsBeforeDeparture + stops) по названию станции
+        stops = (v.get("stops") or []) + []
+        full = (v.get("stopsBeforeDeparture") or []) + stops
+        origin = (cfg.get("origin_name") or "").lower()[:6]
+        dep = next((st.get("departureTime") for st in stops if st.get("departureTime")), None) \
+            or next((st.get("departureTime") for st in full if origin and st.get("name", "").lower().startswith(origin)), None)
+        arr = next((st.get("arrivalTime") for st in reversed(stops) if st.get("arrivalTime")), None)
+        dep, arr = (dep or "")[:19] or None, (arr or "")[:19] or None
+        out.append({"number": v.get("numberForPassengers") or v.get("number"), "name": "", "dep": dep, "arr": arr, "groups": groups})
+    return out
 
 
 def norm_train(num):
@@ -119,10 +195,10 @@ def norm_train(num):
     return "".join(ch for ch in str(num) if ch.isdigit()).lstrip("0") or "0"
 
 
-def find_train(data, train):
+def find_train(trains, train):
     want = norm_train(train)
-    for t in data.get("Trains") or []:
-        if norm_train(t.get("TrainNumber")) == want or norm_train(t.get("DisplayTrainNumber")) == want:
+    for t in trains:
+        if norm_train(t.get("number")) == want:
             return t
     return None
 
@@ -130,15 +206,12 @@ def find_train(data, train):
 def summarize(train, cfg):
     """Сумма мест по нужным типам вагонов."""
     s = {"lower": 0, "upper": 0, "side_lower": 0, "side_upper": 0, "total": 0, "min_price": None}
-    for g in train.get("CarGroups") or []:
-        if g.get("CarType") not in cfg["car_types"] or g.get("IsSaleForbidden"):
+    for g in train["groups"]:
+        if g["car_type"] not in cfg["car_types"]:
             continue
-        s["lower"] += int(g.get("LowerPlaceQuantity") or 0)
-        s["upper"] += int(g.get("UpperPlaceQuantity") or 0)
-        s["side_lower"] += int(g.get("LowerSidePlaceQuantity") or 0)
-        s["side_upper"] += int(g.get("UpperSidePlaceQuantity") or 0)
-        s["total"] += int(g.get("TotalPlaceQuantity") or g.get("PlaceQuantity") or 0)
-        p = g.get("MinPrice")
+        for k in ("lower", "upper", "side_lower", "side_upper", "total"):
+            s[k] += g[k]
+        p = g.get("min_price")
         if p is not None and (s["min_price"] is None or p < s["min_price"]):
             s["min_price"] = p
     s["wanted"] = s["lower"] + (s["side_lower"] if cfg["include_side_lower"] else 0)
@@ -176,20 +249,23 @@ def places_line(s, cfg):
 
 
 def search_url(cfg, date):
+    d = datetime.strptime(date, "%Y-%m-%d")
+    links = ["tutu: https://www.tutu.ru/poezda/rasp_d.php?nnst1=%s&nnst2=%s&date=%s" % (
+        cfg["origin_code"], cfg["destination_code"], d.strftime("%d.%m.%Y"))]
     if cfg.get("origin_node") and cfg.get("destination_node"):
-        return "https://ticket.rzd.ru/searchresults/v/1/%s/%s/%s" % (cfg["origin_node"], cfg["destination_node"], date)
-    return "https://ticket.rzd.ru/"
+        links.insert(0, "РЖД: https://ticket.rzd.ru/searchresults/v/1/%s/%s/%s" % (cfg["origin_node"], cfg["destination_node"], date))
+    return "\n".join(links)
 
 
 def header(cfg, train, date):
-    name = (" «%s»" % train["TrainName"]) if train.get("TrainName") else ""
-    dep = train.get("LocalDepartureDateTime") or "%sT00:00:00" % date
-    arr = train.get("LocalArrivalDateTime")
-    route = "%s → %s" % (cfg.get("origin_name") or train.get("OriginName"), cfg.get("destination_name") or train.get("DestinationName"))
+    name = (" «%s»" % train["name"]) if train.get("name") else ""
+    # tutu иногда отдаёт поезд без остановок и времени — тогда берём departure_time из настроек
+    dep = train.get("dep") or "%sT%s:00" % (date, cfg.get("departure_time") or "00:00")
+    arr = train.get("arr")
+    route = "%s → %s" % (cfg.get("origin_name") or cfg["origin_code"], cfg.get("destination_name") or cfg["destination_code"])
     types = ", ".join(CAR_TYPE_NAMES.get(c, c) for c in cfg["car_types"])
     return "🚆 <b>%s%s</b>, %s\nОтправление %s%s%s\nТип: %s" % (
-        train.get("DisplayTrainNumber") or train.get("TrainNumber"), name, route,
-        fmt_dt(dep), night_hint(dep), (", прибытие " + fmt_dt(arr)) if arr else "", types)
+        train["number"], name, route, fmt_dt(dep), night_hint(dep), (", прибытие " + fmt_dt(arr)) if arr else "", types)
 
 
 # ---------- Telegram ----------
@@ -223,28 +299,30 @@ def run(cfg, state, dry=False):
         if date < today:
             print("%s: дата прошла, пропускаю" % date)
             continue
-        data = search(cfg, date, ctx)
-        train = find_train(data, cfg["train"])
+        trains = search(cfg, date, ctx)
+        train = find_train(trains, cfg["train"])
         prev = prev_all.get(date)
         if not train:
-            print("%s: поезд %s не найден в выдаче (поездов: %d)" % (date, cfg["train"], len(data.get("Trains") or [])))
+            print("%s: поезд %s не найден в выдаче %s (поездов: %d)" % (date, cfg["train"], cfg["source"], len(trains)))
             if prev is None:
                 messages.append("🚆 Поезд %s на %s не найден в выдаче РЖД — проверьте дату. Продолжаю следить." % (cfg["train"], date))
                 prev_all[date] = {"found": False, "wanted": 0}
             continue
         s = summarize(train, cfg)
-        print("%s: %s %s — %s, всего %d, от %s" % (date, train.get("TrainNumber"), train.get("LocalDepartureDateTime"),
-                                                  places_line(s, cfg), s["total"], fmt_price(s["min_price"])))
+        print("%s [%s]: %s %s — %s, всего %d%s" % (date, cfg["source"], train["number"], train.get("dep"),
+                                                places_line(s, cfg), s["total"],
+                                                (", от " + fmt_price(s["min_price"])) if s["min_price"] is not None else ""))
         head = header(cfg, train, date)
         link = search_url(cfg, date)
         was = (prev or {}).get("wanted", 0)
         if s["wanted"] >= cfg["min_lower"] and s["wanted"] > was:
-            messages.append("%s\n\n✅ <b>Появились нижние места: %d</b>\n%s\nВсего мест %d, от %s\n%s" % (
-                head, s["wanted"], places_line(s, cfg), s["total"], fmt_price(s["min_price"]), link))
+            messages.append("%s\n\n✅ <b>Появились нижние места: %d</b>\n%s\nВсего мест %d%s\n%s" % (
+                head, s["wanted"], places_line(s, cfg), s["total"],
+                (", от " + fmt_price(s["min_price"])) if s["min_price"] is not None else "", link))
         elif prev is None or not prev.get("found", True):
             messages.append("%s\n\n👀 Взял на контроль. Сейчас: %s; всего мест %d%s\nНапишу, как только появится нижнее.\n%s" % (
                 head, places_line(s, cfg), s["total"],
-                (", от " + fmt_price(s["min_price"])) if s["total"] else "", link))
+                (", от " + fmt_price(s["min_price"])) if s["total"] and s["min_price"] is not None else "", link))
         elif was >= cfg["min_lower"] and s["wanted"] < cfg["min_lower"]:
             messages.append("%s\n\n❌ Нижние места снова закончились. Сейчас: %s." % (head, places_line(s, cfg)))
         prev_all[date] = {"found": True, "wanted": s["wanted"], "lower": s["lower"], "side_lower": s["side_lower"],

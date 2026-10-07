@@ -28,7 +28,7 @@ else
 fi
 
 echo "=== 2/4 Переменные и секреты (в код не попадают)"
-for k in origin_code origin_node origin_name destination_code destination_node destination_name train dates car_types include_side_lower min_lower; do
+for k in origin_code origin_node origin_name destination_code destination_node destination_name train dates car_types include_side_lower min_lower source departure_time; do
   $GH variable set "$(echo $k | tr a-z A-Z)" --body "$(J "['$k']")"
 done
 J "['telegram']['bot_token']" | $GH secret set TG_BOT_TOKEN
