@@ -1,0 +1,52 @@
+name: Проверка мест РЖД
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # каждые 5 минут (UTC) — минимум GitHub; в загруженные часы запуск опаздывает
+  workflow_dispatch:         # кнопка «Run workflow» для ручного запуска
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rzd-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # состояние (сколько нижних было в прошлый раз) живёт в кэше Actions, а не в коммитах
+      - name: Восстановить состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: rzd-state-${{ github.run_id }}
+          restore-keys: rzd-state-
+
+      - name: Проверить места
+        env:
+          ORIGIN_CODE: ${{ vars.ORIGIN_CODE }}
+          ORIGIN_NODE: ${{ vars.ORIGIN_NODE }}
+          ORIGIN_NAME: ${{ vars.ORIGIN_NAME }}
+          DESTINATION_CODE: ${{ vars.DESTINATION_CODE }}
+          DESTINATION_NODE: ${{ vars.DESTINATION_NODE }}
+          DESTINATION_NAME: ${{ vars.DESTINATION_NAME }}
+          TRAIN: ${{ vars.TRAIN }}
+          DATES: ${{ vars.DATES }}
+          CAR_TYPES: ${{ vars.CAR_TYPES }}
+          INCLUDE_SIDE_LOWER: ${{ vars.INCLUDE_SIDE_LOWER }}
+          MIN_LOWER: ${{ vars.MIN_LOWER }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+        run: python3 check_rzd.py
+
+      - name: Сохранить состояние
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: rzd-state-${{ github.run_id }}-${{ github.run_attempt }}
